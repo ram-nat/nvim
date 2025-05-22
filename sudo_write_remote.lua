@@ -13,6 +13,28 @@ local function parse_netrw_uri(uri)
   end
 end
 
+-- Helper to get the sudo prefix for remote commands, prompting for password if needed.
+-- If password entry is aborted, it cleans up tmp_local_to_cleanup_on_abort (if provided) and errors out.
+local function get_remote_sudo_prefix(user, host, tmp_local_to_cleanup_on_abort)
+  local check_sudo_cmd = string.format("ssh %s@%s 'sudo -n true'", user, host)
+  local needs_password = (os.execute(check_sudo_cmd) ~= 0)
+  local sudo_pass = ""
+  local sudo_prefix = "sudo"
+  if needs_password then
+    sudo_pass = vim.fn.inputsecret("Remote sudo password: ")
+    if sudo_pass == "" then
+      vim.notify("No password entered. Aborting sudo operation.", vim.log.levels.WARN)
+      if tmp_local_to_cleanup_on_abort then
+        os.remove(tmp_local_to_cleanup_on_abort)
+        vim.notify("Cleaned up temporary file: " .. tmp_local_to_cleanup_on_abort, vim.log.levels.INFO)
+      end
+      return nil -- Signal that the user aborted, notifications and cleanup for this path are done.
+    end
+    sudo_prefix = string.format("echo %s | sudo -S", vim.fn.shellescape(sudo_pass))
+  end
+  return sudo_prefix
+end
+
 local function sudo_write_remote()
   local uri = vim.api.nvim_buf_get_name(0)
   if vim.b.remote_sudo_meta then
@@ -33,14 +55,22 @@ local function sudo_write_remote()
 
   -- Write buffer to a temporary local file
   local tmp_local = os.tmpname()
-  vim.api.nvim_command("write! " .. tmp_local)
+  vim.api.nvim_command("write! " .. vim.fn.fnameescape(tmp_local))
 
-  -- Compose remote temporary file path
+  -- Compose remote temporary file path with better uniqueness
   local filename = vim.fn.fnamemodify(info.path, ":t")
-  local remote_tmp = "/tmp/" .. filename .. "." .. info.user
+  local pid = tostring(vim.fn.getpid())
+  local rand = tostring(math.random(100000, 999999))
+  local remote_tmp = string.format("/tmp/%s.%s.%s.%s", filename, info.user, pid, rand)
 
   -- Copy local temp file to remote /tmp
-  local scp_cmd = string.format("scp %s %s@%s:%s", tmp_local, info.user, info.host, remote_tmp)
+  local scp_cmd = string.format(
+    "scp %s %s@%s:%s",
+    vim.fn.shellescape(tmp_local),
+    info.user,
+    info.host,
+    vim.fn.shellescape(remote_tmp)
+  )
   local scp_result = os.execute(scp_cmd)
   if scp_result ~= 0 then
     vim.notify("Failed to copy file to remote host!", vim.log.levels.ERROR)
@@ -48,62 +78,104 @@ local function sudo_write_remote()
     return
   end
 
-  -- Check if sudo requires a password on the remote host
-  local check_sudo_cmd = string.format("ssh %s@%s 'sudo -n true'", info.user, info.host)
-  local needs_password = (os.execute(check_sudo_cmd) ~= 0)
-
-  local sudo_pass = ""
-  local sudo_prefix = "sudo"
-  if needs_password then
-    sudo_pass = vim.fn.inputsecret("Remote sudo password: ")
-    if sudo_pass == "" then
-      vim.notify("No password entered, aborting.", vim.log.levels.WARN)
-      os.remove(tmp_local)
-      return
-    end
-    sudo_prefix = string.format("echo '%s' | sudo -S", sudo_pass)
+  -- Get sudo prefix (may prompt for password)
+  local sudo_prefix = get_remote_sudo_prefix(info.user, info.host, tmp_local)
+  if not sudo_prefix then
+    -- If sudo_prefix is nil, it means get_remote_sudo_prefix handled user notification
+    -- and cleanup (like tmp_local) for the password cancellation.
+    -- So, we just abort this function.
+    return -- Abort sudo_write_remote
   end
 
-  -- Compose SSH script to:
-  -- 1. Capture original mode, owner, group
-  -- 2. Move the file as root
-  -- 3. Restore original mode, owner, group
-  local ssh_script = string.format(
+  local ssh_script_content = string.format(
     [[
-orig_mode=$(stat -c "%%a" %s 2>/dev/null || echo "");
-orig_owner=$(stat -c "%%u" %s 2>/dev/null || echo "");
-orig_group=$(stat -c "%%g" %s 2>/dev/null || echo "");
-%s mv %s %s;
-if [ -n "$orig_owner" ] && [ -n "$orig_group" ]; then %s chown $orig_owner:$orig_group %s; fi;
-if [ -n "$orig_mode" ]; then %s chmod $orig_mode %s; fi
+#!/bin/bash
+TARGET_PATH="$1"
+REMOTE_TMP_PATH="$2"
+  
+orig_mode=$(stat -c "%%a" "${TARGET_PATH}" 2>/dev/null || echo "");
+orig_owner=$(stat -c "%%u" "${TARGET_PATH}" 2>/dev/null || echo "");
+orig_group=$(stat -c "%%g" "${TARGET_PATH}" 2>/dev/null || echo "");
+  
+# Execute move command with sudo_prefix
+%s mv -f "${REMOTE_TMP_PATH}" "${TARGET_PATH}";
+if [ $? -ne 0 ]; then
+  # Attempt to clean up remote temp file if move failed, then exit
+  %s rm -f "${REMOTE_TMP_PATH}"
+  exit 1;
+fi
+  
+# Restore owner/group if they were captured
+if [ -n "$orig_owner" ] && [ -n "$orig_group" ]; then
+  %s chown "$orig_owner:$orig_group" "${TARGET_PATH}";
+fi;
+  
+# Restore mode if it was captured
+if [ -n "$orig_mode" ]; then
+  %s chmod "$orig_mode" "${TARGET_PATH}";
+fi;
+exit 0
 ]],
-    info.path,
-    info.path,
-    info.path,
     sudo_prefix,
-    remote_tmp,
-    info.path,
     sudo_prefix,
-    info.path,
     sudo_prefix,
-    info.path
-  )
+    sudo_prefix
+  ) -- sudo_prefix is used for mv, rm (on fail), chown, chmod
 
-  -- Write the SSH script to a temporary file to avoid shell quoting issues
-  local tmp_script = os.tmpname()
-  local f = io.open(tmp_script, "w")
-  f:write(ssh_script)
-  f:close()
+  local tmp_script_file_path = nil -- Will hold the path if script file is successfully created
+  local ssh_exit_code = -1 -- Initialize with a value indicating not yet run or error
 
-  local ssh_cmd = string.format("ssh %s@%s 'bash -s' < %s", info.user, info.host, tmp_script)
-  local ssh_result = os.execute(ssh_cmd)
+  local pcall_success -- Boolean: Did pcall itself succeed (no Lua error in the anonymous function)?
+  local os_exec_status -- First return from os.execute (true, false, or nil)
+  local os_exec_code_or_msg -- Second return from os.execute (exit code as number, or error message as string)
+  -- local os_exec_signal      -- Third return from os.execute (term signal), not used here
+  pcall_success, os_exec_status, os_exec_code_or_msg = pcall(function()
+    tmp_script_file_path = os.tmpname() -- Generate name for the script file
+    local f = io.open(tmp_script_file_path, "w")
+    if not f then
+      error("Failed to create temporary script file: " .. tmp_script_file_path) -- This error is caught by pcall
+    end
+    -- File is open, write to it
+    f:write(ssh_script_content)
+    f:close()
+    -- tmp_script_file_path now points to a created and populated file
 
-  -- Clean up
-  os.remove(tmp_local)
-  os.remove(tmp_script)
+    local ssh_cmd = string.format(
+      "ssh %s@%s 'bash -s %s %s' < %s",
+      info.user,
+      info.host,
+      vim.fn.shellescape(info.path),
+      vim.fn.shellescape(remote_tmp),
+      vim.fn.shellescape(tmp_script_file_path)
+    )
 
-  if ssh_result ~= 0 then
-    vim.notify("Failed to move file into place as root on remote host!", vim.log.levels.ERROR)
+    return os.execute(ssh_cmd) -- Returns (status, code_or_msg, signal)
+  end)
+
+  -- **Guaranteed Cleanup Section**
+
+  -- 1. Clean up the temporary script file, if its path was determined and file exists.
+  if tmp_script_file_path and vim.fn.filereadable(tmp_script_file_path) == 1 then
+    os.remove(tmp_script_file_path)
+  end
+
+  -- 2. Clean up the local temporary content file.
+  --    It should exist at this point unless get_remote_sudo_prefix errored (which would have halted execution).
+  if vim.fn.filereadable(tmp_local) == 1 then
+    os.remove(tmp_local)
+  end
+
+  -- **Process the result of the pcall'd operations**
+  if not pcall_success then
+    -- A Lua error occurred within the pcall block (e.g., io.open failed and error() was called).
+    -- In this case, os_exec_status (the second value from pcall) holds the error object.
+    vim.notify("Error during remote script execution preparation: " .. tostring(os_exec_status), vim.log.levels.ERROR)
+    return
+  end
+
+  -- If pcall succeeded, os_exec_status and os_exec_code_or_msg are from the os.execute() call
+  if os_exec_status ~= true then
+    vim.notify(string.format("SSH command failed: %s", tostring(os_exec_code_or_msg)), vim.log.levels.ERROR)
     return
   end
 
@@ -121,25 +193,22 @@ local function open_remote_with_sudo(opts)
   end
   local info = parse_netrw_uri(uri)
 
-  -- Prompt for sudo password only if needed
-  local check_sudo_cmd = string.format("ssh %s@%s 'sudo -n true'", info.user, info.host)
-  local needs_password = (os.execute(check_sudo_cmd) ~= 0)
-  local sudo_pass = ""
-  local sudo_prefix = ""
-  if needs_password then
-    sudo_pass = vim.fn.inputsecret("Remote sudo password: ")
-    if sudo_pass == "" then
-      vim.notify("Aborted: No password entered", vim.log.levels.WARN)
-      return
-    end
-    sudo_prefix = string.format("echo '%s' | sudo -S", sudo_pass)
-  else
-    sudo_prefix = "sudo"
+  -- Get sudo prefix (may prompt for password)
+  local sudo_prefix = get_remote_sudo_prefix(info.user, info.host, nil) -- Pass nil for tmp_local_to_cleanup
+  if not sudo_prefix then
+    -- User aborted password entry, get_remote_sudo_prefix handled notifications.
+    return -- Abort open_remote_with_sudo
   end
 
   -- Fetch file via sudo
   local tmp_file = os.tmpname()
-  local fetch_cmd = string.format("ssh %s@%s '%s cat %q' > %s", info.user, info.host, sudo_prefix, info.path, tmp_file)
+  local fetch_cmd = string.format(
+    "ssh %s@%s %s > %s",
+    info.user,
+    info.host,
+    vim.fn.shellescape(string.format("%s cat %s", sudo_prefix, info.path)), -- Remote command
+    vim.fn.shellescape(tmp_file)
+  ) -- Local output file
 
   if os.execute(fetch_cmd) ~= 0 then
     vim.notify(string.format("Failed to fetch file %s on %s with sudo", info.path, info.host), vim.log.levels.ERROR)
@@ -147,7 +216,7 @@ local function open_remote_with_sudo(opts)
     return
   end
 
-  vim.cmd("edit " .. tmp_file)
+  vim.cmd("edit " .. vim.fn.fnameescape(tmp_file))
   local meta = {
     original_uri = uri,
     host = info.host,
